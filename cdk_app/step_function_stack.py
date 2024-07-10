@@ -2,15 +2,14 @@ import aws_cdk as cdk
 from aws_cdk import (
     Stack,
     aws_s3 as s3,
-    aws_s3_notifications as s3n,
     aws_stepfunctions as sfn,
-    aws_stepfunctions_tasks as tasks,
     aws_iam as iam,
     aws_events as events,
     aws_events_targets as targets,
     aws_logs as logs,
 )
 from constructs import Construct
+
 
 class TranslationPipelineStack(Stack):
 
@@ -25,7 +24,7 @@ class TranslationPipelineStack(Stack):
             encryption=s3.BucketEncryption.S3_MANAGED,
             event_bridge_enabled=True,
             removal_policy=cdk.RemovalPolicy.DESTROY,
-            auto_delete_objects=True, 
+            auto_delete_objects=True,
         )
 
         # Create IAM role for Step Functions
@@ -58,33 +57,50 @@ class TranslationPipelineStack(Stack):
         )
 
         # Define Step Functions tasks
-        start_transcription_job = tasks.CallAwsService(
+        start_transcription_job = sfn.CustomState(
             self,
             "StartTranscriptionJob",
-            service="transcribe",
-            action="startTranscriptionJob",
-            parameters={
-                "TranscriptionJobName.$": "States.Format('TranscriptionJob-{}', $$.Execution.Name)",
-                "IdentifyLanguage": True,
-                "Media": {
-                    "MediaFileUri.$": "States.Format('s3://{}/{}', $.detail.bucket.name, $.detail.object.key)"
+            state_json={
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:transcribe:startTranscriptionJob",
+                "Parameters": {
+                    "TranscriptionJobName.$": "States.Format('TranscriptionJob-{}', $$.Execution.Name)",
+                    "IdentifyLanguage": True,
+                    "Media": {
+                        "MediaFileUri.$": "States.Format('s3://{}/{}', $.detail.bucket.name, $.detail.object.key)"
+                    },
+                    "OutputBucketName.$": "$.detail.bucket.name",
                 },
-                "OutputBucketName.$": "$.detail.bucket.name",
+                "ResultPath": "$.TranscriptionJobDetails",
             },
-            iam_resources=["*"],
-            result_path="$.TranscriptionJobDetails",
         )
 
-        get_transcription_job = tasks.CallAwsService(
+        get_transcription_job = sfn.CustomState(
             self,
             "GetTranscriptionJob",
-            service="transcribe",
-            action="getTranscriptionJob",
-            parameters={
-                "TranscriptionJobName.$": "$.TranscriptionJobDetails.TranscriptionJob.TranscriptionJobName"
+            state_json={
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:transcribe:getTranscriptionJob",
+                "Parameters": {
+                    "TranscriptionJobName.$": "$.TranscriptionJobDetails.TranscriptionJob.TranscriptionJobName"
+                },
+                "ResultPath": "$.TranscriptionJobDetails",
             },
-            iam_resources=["*"],
-            result_path="$.TranscriptionJobDetails",
+        )
+
+        get_transcription_file = sfn.CustomState(
+            self,
+            "GetTranscriptionFile",
+            state_json={
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+                "Parameters": {
+                    "Bucket.$": "States.ArrayGetItem(States.StringSplit($.TranscriptionJobDetails.TranscriptionJob.Transcript.TranscriptFileUri, '/'), 2)",
+                    "Key.$": "States.ArrayGetItem(States.StringSplit($.TranscriptionJobDetails.TranscriptionJob.Transcript.TranscriptFileUri, '/'), 3)",
+                },
+                "ResultSelector": {"FileContents.$": "States.StringToJson($.Body)"},
+                "ResultPath": "$.TranscriptionFile",
+            },
         )
 
         wait_state = sfn.Wait(
@@ -93,57 +109,45 @@ class TranslationPipelineStack(Stack):
             time=sfn.WaitTime.duration(cdk.Duration.seconds(45)),
         )
 
-        get_transcription_file = tasks.CallAwsService(
-            self,
-            "GetTranscriptionFile",
-            service="s3",
-            action="getObject",
-            parameters={
-                "Bucket.$": "States.ArrayGetItem(States.StringSplit($.TranscriptionJobDetails.TranscriptionJob.Transcript.TranscriptFileUri, '/'), 2)",
-                "Key.$": "States.ArrayGetItem(States.StringSplit($.TranscriptionJobDetails.TranscriptionJob.Transcript.TranscriptFileUri, '/'), 3)",
-            },
-            iam_resources=["*"],
-            result_selector={"FileContents.$": "States.StringToJson($.Body)"},
-            result_path="$.TranscriptionFile",
-        )
-
-        translate_text = tasks.CallAwsService(
+        translate_text = sfn.CustomState(
             self,
             "TranslateText",
-            service="translate",
-            action="translateText",
-            parameters={
-                "SourceLanguageCode.$": "$.TranscriptionJobDetails.TranscriptionJob.LanguageCode",
-                "TargetLanguageCode": "en",
-                "Text.$": "$.TranscriptionFile.FileContents.results.transcripts[0].transcript",
+            state_json={
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:translate:translateText",
+                "Parameters": {
+                    "SourceLanguageCode.$": "$.TranscriptionJobDetails.TranscriptionJob.LanguageCode",
+                    "TargetLanguageCode": "en",
+                    "Text.$": "$.TranscriptionFile.FileContents.results.transcripts[0].transcript",
+                },
+                "ResultPath": "$.TranslatedText",
             },
-            iam_resources=["*"],
-            result_path="$.TranslatedText",
         )
 
-        synthesize_speech = tasks.CallAwsService(
+        synthesize_speech = sfn.CustomState(
             self,
             "SynthesizeSpeech",
-            service="polly",
-            action="startSpeechSynthesisTask",
-            parameters={
-                "OutputFormat": "mp3",
-                "OutputS3BucketName.$": "$.detail.bucket.name",
-                "OutputS3KeyPrefix": "translations/",
-                "Text.$": "$.TranslatedText.TranslatedText",
-                "VoiceId": "Joanna",
+            state_json={
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:polly:startSpeechSynthesisTask",
+                "Parameters": {
+                    "OutputFormat": "mp3",
+                    "OutputS3BucketName.$": "$.detail.bucket.name",
+                    "OutputS3KeyPrefix": "translations/",
+                    "Text.$": "$.TranslatedText.TranslatedText",
+                    "VoiceId": "Joanna",
+                },
             },
-            iam_resources=["*"],
         )
 
         # Define Choice state to determine if the language is English
         is_language_english = sfn.Choice(self, "IsLanguageEnglish?")
         is_language_english.when(
-            sfn.Condition.string_matches("$.TranscriptionJobDetails.TranscriptionJob.LanguageCode", "en*"),
-            sfn.Pass(self, "SkipTranslation")
-        ).otherwise(
-            get_transcription_file.next(translate_text).next(synthesize_speech)
-        )
+            sfn.Condition.string_matches(
+                "$.TranscriptionJobDetails.TranscriptionJob.LanguageCode", "en*"
+            ),
+            sfn.Pass(self, "SkipTranslation"),
+        ).otherwise(get_transcription_file.next(translate_text).next(synthesize_speech))
 
         definition = (
             start_transcription_job.next(wait_state)
@@ -155,7 +159,7 @@ class TranslationPipelineStack(Stack):
                         "$.TranscriptionJobDetails.TranscriptionJob.TranscriptionJobStatus",
                         "COMPLETED",
                     ),
-                    is_language_english
+                    is_language_english,
                 )
                 .otherwise(wait_state)
             )
