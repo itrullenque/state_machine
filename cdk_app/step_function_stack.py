@@ -9,23 +9,23 @@ from aws_cdk import (
     aws_events as events,
     aws_events_targets as targets,
     aws_logs as logs,
-    aws_cloudtrail as cloudtrail,
 )
 from constructs import Construct
-
 
 class TranslationPipelineStack(Stack):
 
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        # Create S3 bucket
+        # Create S3 bucket with lifecycle policy to delete objects
         bucket = s3.Bucket(
             self,
             "AudioBucketNew",
             versioned=True,
             encryption=s3.BucketEncryption.S3_MANAGED,
             event_bridge_enabled=True,
+            removal_policy=cdk.RemovalPolicy.DESTROY,
+            auto_delete_objects=True, 
         )
 
         # Create IAM role for Step Functions
@@ -136,6 +136,15 @@ class TranslationPipelineStack(Stack):
             iam_resources=["*"],
         )
 
+        # Define Choice state to determine if the language is English
+        is_language_english = sfn.Choice(self, "IsLanguageEnglish?")
+        is_language_english.when(
+            sfn.Condition.string_matches("$.TranscriptionJobDetails.TranscriptionJob.LanguageCode", "en*"),
+            sfn.Pass(self, "SkipTranslation")
+        ).otherwise(
+            get_transcription_file.next(translate_text).next(synthesize_speech)
+        )
+
         definition = (
             start_transcription_job.next(wait_state)
             .next(get_transcription_job)
@@ -146,7 +155,7 @@ class TranslationPipelineStack(Stack):
                         "$.TranscriptionJobDetails.TranscriptionJob.TranscriptionJobStatus",
                         "COMPLETED",
                     ),
-                    get_transcription_file.next(translate_text).next(synthesize_speech),
+                    is_language_english
                 )
                 .otherwise(wait_state)
             )
