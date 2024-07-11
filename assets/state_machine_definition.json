@@ -1,0 +1,96 @@
+{
+  "StartAt": "StartTranscriptionJob",
+  "States": {
+    "StartTranscriptionJob": {
+      "Next": "WaitForTranscription",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:transcribe:startTranscriptionJob",
+      "Parameters": {
+        "TranscriptionJobName.$": "States.Format('TranscriptionJob-{}', $$.Execution.Name)",
+        "IdentifyLanguage": true,
+        "Media": {
+          "MediaFileUri.$": "States.Format('s3://{}/{}', $.detail.bucket.name, $.detail.object.key)"
+        },
+        "OutputBucketName.$": "$.detail.bucket.name",
+        "OutputKey": "transcriptions/"
+      },
+      "ResultPath": "$.TranscriptionJobDetails"
+    },
+    "WaitForTranscription": {
+      "Type": "Wait",
+      "Seconds": 20,
+      "Next": "GetTranscriptionJob"
+    },
+    "GetTranscriptionJob": {
+      "Next": "TranscriptionComplete?",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:transcribe:getTranscriptionJob",
+      "Parameters": {
+        "TranscriptionJobName.$": "$.TranscriptionJobDetails.TranscriptionJob.TranscriptionJobName"
+      },
+      "ResultPath": "$.TranscriptionJobDetails"
+    },
+    "TranscriptionComplete?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.TranscriptionJobDetails.TranscriptionJob.TranscriptionJobStatus",
+          "StringEquals": "COMPLETED",
+          "Next": "IsLanguageEnglish?"
+        }
+      ],
+      "Default": "WaitForTranscription"
+    },
+    "IsLanguageEnglish?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.TranscriptionJobDetails.TranscriptionJob.LanguageCode",
+          "StringMatches": "en*",
+          "Next": "SkipTranslation"
+        }
+      ],
+      "Default": "GetTranscriptionFile"
+    },
+    "GetTranscriptionFile": {
+      "Next": "TranslateText",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+      "Parameters": {
+        "Bucket.$": "States.ArrayGetItem(States.StringSplit($.TranscriptionJobDetails.TranscriptionJob.Transcript.TranscriptFileUri, '/'), 2)",
+        "Key.$": "States.Format('transcriptions/{}', States.ArrayGetItem(States.StringSplit($.TranscriptionJobDetails.TranscriptionJob.Transcript.TranscriptFileUri, '/'), 4))"
+      },
+      "ResultSelector": {
+        "FileContents.$": "States.StringToJson($.Body)"
+      },
+      "ResultPath": "$.TranscriptionFile"
+    },
+    "TranslateText": {
+      "Next": "SynthesizeSpeech",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:translate:translateText",
+      "Parameters": {
+        "SourceLanguageCode.$": "$.TranscriptionJobDetails.TranscriptionJob.LanguageCode",
+        "TargetLanguageCode": "en",
+        "Text.$": "$.TranscriptionFile.FileContents.results.transcripts[0].transcript"
+      },
+      "ResultPath": "$.TranslatedText"
+    },
+    "SynthesizeSpeech": {
+      "End": true,
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:polly:startSpeechSynthesisTask",
+      "Parameters": {
+        "OutputFormat": "mp3",
+        "OutputS3BucketName.$": "$.detail.bucket.name",
+        "OutputS3KeyPrefix": "translations/",
+        "Text.$": "$.TranslatedText.TranslatedText",
+        "VoiceId": "Joanna"
+      }
+    },
+    "SkipTranslation": {
+      "Type": "Pass",
+      "End": true
+    }
+  }
+}
